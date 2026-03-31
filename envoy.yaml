@@ -1,0 +1,82 @@
+# envoy.yaml
+static_resources:
+  listeners:
+    - name: ingress
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8443 }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              require_client_certificate: true
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain: { filename: "/etc/envoy/certs/server.crt" }
+                    private_key:       { filename: "/etc/envoy/certs/server.key" }
+                validation_context:
+                  trusted_ca: { filename: "/etc/envoy/certs/ca.crt" }
+                  match_typed_subject_alt_names:
+                    - san_type: URI
+                      matcher:
+                        prefix: "spiffe://poc/"
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                http_filters:
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      grpc_service:
+                        envoy_grpc:
+                          cluster_name: ext_authz_cluster
+                        timeout: 2s
+                      transport_api_version: V3
+                      # Critical: sends the peer X.509 cert (URL-encoded PEM) 
+                      # in CheckRequest.attributes.source.certificate
+                      include_peer_certificate: true
+                      # If ext_authz is unavailable, fail open (set false in prod)
+                      failure_mode_allow: false
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: upstream_cluster }
+
+  clusters:
+    - name: ext_authz_cluster
+      type: STATIC
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: ext_authz_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 9191 }
+
+    - name: upstream_cluster
+      type: STATIC
+      load_assignment:
+        cluster_name: upstream_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 8080 }
+
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
