@@ -1,0 +1,11 @@
+apiVersion: policy.poc.io/v1alpha1
+kind: Policy
+metadata:
+  name: spiffe-identity
+  namespace: poc
+spec:
+  type: spiffe
+  order: 10
+  config:
+    allowedIDs:
+      - spiffe://poc/go-client

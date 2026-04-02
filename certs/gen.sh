@@ -36,5 +36,10 @@ openssl req -new -key client.key -out client.csr -subj "/CN=go-client" -config c
 openssl x509 -req -days 365 -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
   -out client.crt -extensions v3_req -extfile client-ext.cnf
 
+# Proxy CA — separate CA for MITM TLS interception
+openssl genrsa -out proxy-ca.key 4096
+openssl req -new -x509 -days 365 -key proxy-ca.key -out proxy-ca.crt \
+  -subj "/CN=poc-proxy-ca/O=POC MITM Proxy"
+
 echo "Certs ready:"
 ls -la *.crt *.key

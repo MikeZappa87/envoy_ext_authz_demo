@@ -1,10 +1,14 @@
 # Makefile for Envoy mTLS + ext_authz POC
 
-.PHONY: all certs deps run-ext-authz run-ext-authz-opa run-opa run-upstream run-envoy run-client stop clean help
+.PHONY: all certs deps run-policyengine run-upstream run-envoy run-client run-connect run-mitm stop clean help \
+        k8s-cluster k8s-build k8s-deploy k8s-test-allow k8s-test-deny k8s-test-body-deny k8s-test-all k8s-logs k8s-destroy \
+        k8s-apply-policies k8s-delete-policies k8s-test-connect-allow k8s-test-connect-deny \
+        k8s-test-mitm-allow k8s-test-mitm-deny-domain k8s-test-mitm-deny-path
 
 ENVOY_IMAGE := envoyproxy/envoy:v1.37-latest
-OPA_IMAGE   := openpolicyagent/opa:latest
 CERT_DIR    := certs
+CLUSTER     := poc
+K8S_NS      := poc
 
 ##@ Setup
 
@@ -30,22 +34,11 @@ deps: ## Download and tidy Go dependencies
 	@go mod tidy
 	@echo "==> Done."
 
-##@ Run (each in its own terminal, or use run-all with tmux)
+##@ Run (each in its own terminal)
 
-run-ext-authz: ## Run the ext_authz gRPC server on :9191 (built-in allowlist)
-	@echo "==> Starting ext_authz server on :9191 (built-in allowlist)"
-	go run ./ext_authz/main.go
-
-run-opa: ## Run OPA server on :8181 with the authz policy
-	@echo "==> Starting OPA on :8181..."
-	docker run --rm --network host \
-		--name poc-opa \
-		-v $(PWD)/opa:/policy \
-		$(OPA_IMAGE) run --server --addr :8181 /policy/policy.rego
-
-run-ext-authz-opa: ## Run ext_authz on :9191, delegating to OPA on :8181
-	@echo "==> Starting ext_authz server on :9191 (OPA mode)"
-	go run ./ext_authz/main.go -opa http://localhost:8181/v1/data/envoy/authz
+run-policyengine: ## Run the unified policy engine on :9191 (ext_authz + ext_proc)
+	@echo "==> Starting policy engine on :9191"
+	go run ./policyengine/
 
 run-upstream: ## Run the upstream HTTP app on :8080
 	@echo "==> Starting upstream server on :8080"
@@ -63,33 +56,9 @@ run-client: ## Run the Go mTLS client (sends one request)
 	@echo "==> Running Go client..."
 	go run ./client/main.go
 
-##@ Tmux (runs all services in one window)
-
-run-all: ## Launch all services in a tmux session (requires tmux)
-	@which tmux > /dev/null || (echo "tmux not found — install it or run each target separately"; exit 1)
-	@echo "==> Starting tmux session 'poc'..."
-	@tmux new-session -d -s poc -x 220 -y 50
-	@tmux rename-window -t poc:0 'services'
-	@# Split into 4 panes
-	@tmux split-window -h   -t poc:0
-	@tmux split-window -v   -t poc:0.0
-	@tmux split-window -v   -t poc:0.2
-	@# Run each service in its pane
-	@tmux send-keys -t poc:0.0 'make run-ext-authz' Enter
-	@tmux send-keys -t poc:0.1 'make run-upstream'  Enter
-	@tmux send-keys -t poc:0.2 'make run-envoy'     Enter
-	@echo "==> Waiting 5s for services to be ready..."
-	@sleep 5
-	@tmux send-keys -t poc:0.3 'make run-client'    Enter
-	@tmux attach-session -t poc
-
-stop: ## Stop the tmux session and Envoy/OPA containers
+stop: ## Stop the Envoy container
 	@echo "==> Stopping Envoy container..."
 	@docker stop poc-envoy 2>/dev/null || true
-	@echo "==> Stopping OPA container..."
-	@docker stop poc-opa 2>/dev/null || true
-	@echo "==> Killing tmux session..."
-	@tmux kill-session -t poc 2>/dev/null || true
 
 ##@ Test
 
@@ -109,7 +78,25 @@ test-deny: ## Test denied request (valid cert, disallowed path)
 		--key    $(CERT_DIR)/client.key \
 		https://localhost:8443/notallowedhere
 
-test-all: test-allow test-deny ## Run both test cases
+test-body-deny: ## Test denied request (blocked JSON body)
+	@echo "==> Testing DENY (blocked body action)..."
+	curl -s -o - -w "\nHTTP %{http_code}\n" \
+		--cacert $(CERT_DIR)/ca.crt \
+		--cert   $(CERT_DIR)/client.crt \
+		--key    $(CERT_DIR)/client.key \
+		-X POST -H "Content-Type: application/json" \
+		-d '{"action":"blocked"}' \
+		https://localhost:8443/hello
+
+test-all: test-allow test-deny test-body-deny ## Run all test cases
+
+run-connect: ## Run the CONNECT tunnel client (local)
+	@echo "==> CONNECT tunnel via localhost:8444..."
+	go run ./connect/ -proxy localhost:8444 -target 127.0.0.1:8080
+
+run-mitm: ## Run the MITM TLS-interception proxy on :9192 (local)
+	@echo "==> Starting MITM proxy on :9192"
+	go run ./mitm/
 
 ##@ Cleanup
 
@@ -119,6 +106,150 @@ clean: stop ## Remove certs, go.mod, go.sum, and stop services
 	        $(CERT_DIR)/*.srl $(CERT_DIR)/*.cnf
 	@rm -f go.mod go.sum
 	@echo "==> Done."
+
+##@ Kind / Kubernetes
+
+k8s-cluster: ## Create a Kind cluster with port mappings
+	@echo "==> Creating Kind cluster '$(CLUSTER)'..."
+	kind create cluster --name $(CLUSTER) --config k8s/kind-config.yaml
+	@echo "==> Cluster ready."
+
+k8s-build: ## Build and load Docker images into Kind
+	@echo "==> Building policyengine image..."
+	docker build -t poc-policyengine:latest -f policyengine/Dockerfile .
+	@echo "==> Building upstream image..."
+	docker build -t poc-upstream:latest -f upstream/Dockerfile .
+	@echo "==> Loading images into Kind..."
+	kind load docker-image poc-policyengine:latest --name $(CLUSTER)
+	kind load docker-image poc-upstream:latest --name $(CLUSTER)
+	@echo "==> Images loaded."
+
+k8s-deploy: certs ## Deploy all resources to the Kind cluster
+	@echo "==> Creating namespace..."
+	@kubectl apply -f k8s/namespace.yaml
+	@echo "==> Installing CRD..."
+	@kubectl apply -f k8s/crd.yaml
+	@echo "==> Creating RBAC..."
+	@kubectl apply -f k8s/rbac.yaml
+	@echo "==> Creating secrets and configmaps..."
+	@kubectl create secret generic envoy-certs \
+		--namespace $(K8S_NS) \
+		--from-file=ca.crt=$(CERT_DIR)/ca.crt \
+		--from-file=server.crt=$(CERT_DIR)/server.crt \
+		--from-file=server.key=$(CERT_DIR)/server.key \
+		--dry-run=client -o yaml | kubectl apply -f -
+	@kubectl create configmap envoy-config \
+		--namespace $(K8S_NS) \
+		--from-file=envoy.yaml=k8s/envoy.yaml \
+		--dry-run=client -o yaml | kubectl apply -f -
+	@kubectl create secret generic proxy-ca-certs \
+		--namespace $(K8S_NS) \
+		--from-file=proxy-ca.crt=$(CERT_DIR)/proxy-ca.crt \
+		--from-file=proxy-ca.key=$(CERT_DIR)/proxy-ca.key \
+		--dry-run=client -o yaml | kubectl apply -f -
+	@echo "==> Deploying workloads..."
+	@kubectl apply -f k8s/opa.yaml
+	@kubectl apply -f k8s/upstream.yaml
+	@kubectl apply -f k8s/policyengine.yaml
+	@kubectl apply -f k8s/envoy-deploy.yaml
+	@echo "==> Applying Policy CRs..."
+	@kubectl apply -f k8s/policies/
+	@echo "==> Waiting for pods to be ready..."
+	@kubectl rollout status deployment/opa            -n $(K8S_NS) --timeout=60s
+	@kubectl rollout status deployment/upstream       -n $(K8S_NS) --timeout=60s
+	@kubectl rollout status deployment/policyengine   -n $(K8S_NS) --timeout=60s
+	@kubectl rollout status deployment/envoy          -n $(K8S_NS) --timeout=60s
+	@echo "==> All pods running. Envoy available at https://localhost:8443"
+
+k8s-apply-policies: ## Apply Policy CRs from k8s/policies/
+	@echo "==> Applying Policy CRs..."
+	@kubectl apply -f k8s/policies/
+	@echo "==> Current policies:"
+	@kubectl get policies -n $(K8S_NS)
+
+k8s-delete-policies: ## Delete all Policy CRs
+	@echo "==> Deleting all Policy CRs..."
+	@kubectl delete policies --all -n $(K8S_NS)
+	@echo "==> Done."
+
+k8s-test-allow: ## Test allowed request against Kind cluster
+	@echo "==> Testing ALLOW (Kind cluster)..."
+	curl -s -o - -w "\nHTTP %{http_code}\n" \
+		--cacert $(CERT_DIR)/ca.crt \
+		--cert   $(CERT_DIR)/client.crt \
+		--key    $(CERT_DIR)/client.key \
+		https://localhost:8443/hello
+
+k8s-test-deny: ## Test denied request against Kind cluster
+	@echo "==> Testing DENY (Kind cluster)..."
+	curl -s -o - -w "\nHTTP %{http_code}\n" \
+		--cacert $(CERT_DIR)/ca.crt \
+		--cert   $(CERT_DIR)/client.crt \
+		--key    $(CERT_DIR)/client.key \
+		https://localhost:8443/notallowedhere
+
+k8s-test-body-deny: ## Test denied body against Kind cluster
+	@echo "==> Testing BODY DENY (Kind cluster)..."
+	curl -s -o - -w "\nHTTP %{http_code}\n" \
+		--cacert $(CERT_DIR)/ca.crt \
+		--cert   $(CERT_DIR)/client.crt \
+		--key    $(CERT_DIR)/client.key \
+		-X POST -H "Content-Type: application/json" \
+		-d '{"action":"blocked"}' \
+		https://localhost:8443/hello
+
+k8s-test-all: k8s-test-allow k8s-test-deny k8s-test-body-deny k8s-test-connect-allow k8s-test-connect-deny k8s-test-mitm-allow k8s-test-mitm-deny-domain k8s-test-mitm-deny-path ## Run all K8s test cases
+
+k8s-test-connect-allow: ## Test allowed CONNECT tunnel against Kind cluster
+	@echo "==> Testing CONNECT ALLOW (Kind cluster)..."
+	go run ./connect/ -proxy localhost:8444 -target upstream.poc.svc.cluster.local:8080
+
+k8s-test-connect-deny: ## Test denied CONNECT destination against Kind cluster
+	@echo "==> Testing CONNECT DENY (Kind cluster)..."
+	@go run ./connect/ -proxy localhost:8444 -target evil.example.com:443 2>&1; \
+	if [ $$? -ne 0 ]; then echo "=> Correctly denied"; fi
+
+k8s-test-mitm-allow: ## Test MITM: allowed HTTPS URL (httpbin.org/get)
+	@echo "==> Testing MITM ALLOW (httpbin.org/get)..."
+	curl -s -o - -w "\nHTTP %{http_code}\n" \
+		--proxy https://localhost:8445 \
+		--proxy-cacert $(CERT_DIR)/ca.crt \
+		--proxy-cert   $(CERT_DIR)/client.crt \
+		--proxy-key    $(CERT_DIR)/client.key \
+		--cacert $(CERT_DIR)/proxy-ca.crt \
+		https://httpbin.org/get
+
+k8s-test-mitm-deny-domain: ## Test MITM: blocked domain (foxnews.com)
+	@echo "==> Testing MITM DENY domain (foxnews.com)..."
+	@curl -s -o - -w "\nHTTP %{http_code}\n" \
+		--proxy https://localhost:8445 \
+		--proxy-cacert $(CERT_DIR)/ca.crt \
+		--proxy-cert   $(CERT_DIR)/client.crt \
+		--proxy-key    $(CERT_DIR)/client.key \
+		--cacert $(CERT_DIR)/proxy-ca.crt \
+		https://foxnews.com/ || true
+
+k8s-test-mitm-deny-path: ## Test MITM: blocked path (httpbin.org/post)
+	@echo "==> Testing MITM DENY path (httpbin.org/post)..."
+	curl -s -o - -w "\nHTTP %{http_code}\n" \
+		--proxy https://localhost:8445 \
+		--proxy-cacert $(CERT_DIR)/ca.crt \
+		--proxy-cert   $(CERT_DIR)/client.crt \
+		--proxy-key    $(CERT_DIR)/client.key \
+		--cacert $(CERT_DIR)/proxy-ca.crt \
+		https://httpbin.org/post -X POST -d 'test'
+
+k8s-logs: ## Tail logs from all pods in the poc namespace
+	@kubectl logs -n $(K8S_NS) -l app=policyengine --tail=20 --prefix
+	@echo "---"
+	@kubectl logs -n $(K8S_NS) -l app=envoy --tail=20 --prefix
+	@echo "---"
+	@kubectl logs -n $(K8S_NS) -l app=upstream --tail=20 --prefix
+
+k8s-destroy: ## Delete the Kind cluster
+	@echo "==> Deleting Kind cluster '$(CLUSTER)'..."
+	@kind delete cluster --name $(CLUSTER)
+	@echo "==> Cluster deleted."
 
 ##@ Help
 

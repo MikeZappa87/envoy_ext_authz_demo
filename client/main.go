@@ -40,6 +40,8 @@ func main() {
 	tlsCfg := &tls.Config{
 		Certificates: []tls.Certificate{clientCert},
 		RootCAs:      caPool,
+		MinVersion:   tls.VersionTLS13,
+		NextProtos:   []string{"h2"},
 		// Must match the SAN on Envoy's server cert, not the CN.
 		// Our server.crt has SAN=spiffe://poc/envoy so we override
 		// ServerName to bypass hostname check since we're using SPIFFE SANs.

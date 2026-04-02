@@ -1,0 +1,11 @@
+apiVersion: policy.poc.io/v1alpha1
+kind: Policy
+metadata:
+  name: inject-headers
+  namespace: poc
+spec:
+  type: header-inject
+  order: 15
+  config:
+    set:
+      agent: zappa

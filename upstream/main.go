@@ -10,11 +10,12 @@ import (
 func handler(w http.ResponseWriter, r *http.Request) {
 	spiffeID := r.Header.Get("x-spiffe-id")
 	subject := r.Header.Get("x-cert-subject")
+	agent := r.Header.Get("agent")
 
-	log.Printf("upstream: SPIFFE ID=%q subject=%q", spiffeID, subject)
+	log.Printf("upstream: SPIFFE ID=%q subject=%q agent=%q", spiffeID, subject, agent)
 
-	fmt.Fprintf(w, "Request authorized!\nSPIFFE ID:    %s\nCert Subject: %s\n",
-		spiffeID, subject)
+	fmt.Fprintf(w, "Request authorized!\nSPIFFE ID:    %s\nCert Subject: %s\nAgent:        %s\n",
+		spiffeID, subject, agent)
 }
 
 func main() {

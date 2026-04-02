@@ -1,7 +1,6 @@
-# envoy.yaml
+# envoy.yaml for Kubernetes — services resolved via cluster DNS
 #
-# Simplified config: both ext_authz and ext_proc point to a single
-# "policyengine" cluster. All policy logic lives in one Go binary.
+# Both ext_authz and ext_proc point to a single "policyengine" service.
 static_resources:
   listeners:
     - name: ingress
@@ -202,7 +201,7 @@ static_resources:
 
   clusters:
     - name: policyengine_cluster
-      type: STATIC
+      type: STRICT_DNS
       typed_extension_protocol_options:
         envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
           "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
@@ -214,27 +213,27 @@ static_resources:
           - lb_endpoints:
               - endpoint:
                   address:
-                    socket_address: { address: 127.0.0.1, port_value: 9191 }
+                    socket_address: { address: policyengine.poc.svc.cluster.local, port_value: 9191 }
 
     - name: upstream_cluster
-      type: STATIC
+      type: STRICT_DNS
       load_assignment:
         cluster_name: upstream_cluster
         endpoints:
           - lb_endpoints:
               - endpoint:
                   address:
-                    socket_address: { address: 127.0.0.1, port_value: 8080 }
+                    socket_address: { address: upstream.poc.svc.cluster.local, port_value: 8080 }
 
     - name: mitm_cluster
-      type: STATIC
+      type: STRICT_DNS
       load_assignment:
         cluster_name: mitm_cluster
         endpoints:
           - lb_endpoints:
               - endpoint:
                   address:
-                    socket_address: { address: 127.0.0.1, port_value: 9192 }
+                    socket_address: { address: policyengine.poc.svc.cluster.local, port_value: 9192 }
 
 admin:
   address:
