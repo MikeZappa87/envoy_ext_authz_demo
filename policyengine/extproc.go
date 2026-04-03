@@ -50,6 +50,7 @@ func (s *extProcServer) Process(stream ext_proc.ExternalProcessor_ProcessServer)
 			rctx.Path = rctx.Headers[":path"]
 			rctx.SpiffeID = rctx.Headers["x-spiffe-id"]
 			rctx.Subject = rctx.Headers["x-cert-subject"]
+			rctx.RequestID = rctx.Headers["x-request-id"]
 			rctx.Phase = PhaseRequestHeaders
 
 			// Strip internal identity headers so they don't leak to upstream.

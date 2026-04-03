@@ -55,6 +55,7 @@ func (s *authzServer) Check(ctx context.Context, req *auth.CheckRequest) (*auth.
 		Method:        httpReq.GetMethod(),
 		Path:          httpReq.GetPath(),
 		Headers:       httpReq.GetHeaders(),
+		RequestID:     httpReq.GetHeaders()["x-request-id"],
 		Phase:         PhaseAuthz,
 		SetHeaders:    make(map[string]string),
 		RemoveHeaders: nil,

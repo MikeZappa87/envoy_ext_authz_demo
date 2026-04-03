@@ -62,6 +62,9 @@ type RequestContext struct {
 	Body             []byte
 	ConnectAuthority string // :authority from CONNECT requests (original destination)
 
+	// Correlation
+	RequestID string // x-request-id from Envoy for log correlation
+
 	// Current phase
 	Phase Phase
 
@@ -140,11 +143,15 @@ func (e *Engine) Run(ctx *RequestContext) *PolicyResult {
 			ctx.Phase, p.Name(), actionStr(result.Action), result.Message)
 
 		if result.Action == ActionDeny {
+			LogAccess(ctx, p.Name(), result)
 			return result
 		}
 	}
 
-	return &PolicyResult{Action: ActionContinue, Message: "all policies passed"}
+	// Log the final allow with the last policy that ran (or "none").
+	allowResult := &PolicyResult{Action: ActionContinue, Message: "all policies passed"}
+	LogAccess(ctx, "chain", allowResult)
+	return allowResult
 }
 
 func policyMatchesPhase(p Policy, phase Phase) bool {

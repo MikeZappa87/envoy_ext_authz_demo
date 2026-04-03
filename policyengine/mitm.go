@@ -306,6 +306,7 @@ func (p *mitmProxy) runPolicy(domain string, req *http.Request, body []byte) (*P
 		Host:       domain,
 		Headers:    headers,
 		Body:       body,
+		RequestID:  headers["x-request-id"],
 		SetHeaders: make(map[string]string),
 	}
 
