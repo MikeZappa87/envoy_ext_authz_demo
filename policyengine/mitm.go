@@ -43,11 +43,12 @@ type mitmProxy struct {
 	caCert     *x509.Certificate
 	caKey      *rsa.PrivateKey
 	engine     *Engine
+	connStore  *ConnIdentityStore
 	certCache  sync.Map // domain → *tls.Certificate
 	httpClient *http.Client
 }
 
-func newMITMProxy(caCertFile, caKeyFile string, engine *Engine) (*mitmProxy, error) {
+func newMITMProxy(caCertFile, caKeyFile string, engine *Engine, connStore *ConnIdentityStore) (*mitmProxy, error) {
 	caCertPEM, err := os.ReadFile(caCertFile)
 	if err != nil {
 		return nil, fmt.Errorf("read CA cert: %w", err)
@@ -83,9 +84,10 @@ func newMITMProxy(caCertFile, caKeyFile string, engine *Engine) (*mitmProxy, err
 	}
 
 	return &mitmProxy{
-		caCert: caCert,
-		caKey:  caKey,
-		engine: engine,
+		caCert:    caCert,
+		caKey:     caKey,
+		engine:    engine,
+		connStore: connStore,
 		httpClient: &http.Client{
 			Timeout: 15 * time.Second,
 			Transport: &http.Transport{
@@ -166,27 +168,50 @@ func (c *peekedConn) Read(b []byte) (int, error) { return c.r.Read(b) }
 func (p *mitmProxy) handleConn(conn net.Conn) {
 	defer conn.Close()
 
+	// Parse PROXY protocol v1 header to get the real client IP.
+	// Format: "PROXY TCP4 <srcIP> <dstIP> <srcPort> <dstPort>\r\n"
+	br := bufio.NewReader(conn)
+	proxyLine, err := br.ReadString('\n')
+	if err != nil {
+		log.Printf("mitm: failed to read PROXY protocol header: %v", err)
+		return
+	}
+
+	var realClientIP string
+	fields := strings.Fields(proxyLine)
+	if len(fields) >= 3 && fields[0] == "PROXY" {
+		realClientIP = fields[2]
+	}
+
+	// Look up the SPIFFE ID using the real (pre-NAT) client IP.
+	spiffeID := ""
+	if p.connStore != nil && realClientIP != "" {
+		spiffeID = p.connStore.Get(realClientIP)
+	}
+	// Wrap the buffered reader back into a conn for downstream handlers.
+	wrappedConn := &peekedConn{Conn: conn, r: br}
+
 	// Peek at the first byte to determine protocol.
 	buf := make([]byte, 1)
-	if _, err := io.ReadFull(conn, buf); err != nil {
+	if _, err := io.ReadFull(wrappedConn, buf); err != nil {
 		log.Printf("mitm: peek failed: %v", err)
 		return
 	}
 
 	// Re-combine the peeked byte with the rest of the connection.
-	pConn := &peekedConn{Conn: conn, r: io.MultiReader(bytes.NewReader(buf), conn)}
+	pConn := &peekedConn{Conn: conn, r: io.MultiReader(bytes.NewReader(buf), wrappedConn)}
 
 	if buf[0] == 0x16 {
 		// TLS ClientHello — do full MITM interception.
-		p.handleTLS(pConn)
+		p.handleTLS(pConn, spiffeID)
 	} else {
 		// Plaintext HTTP — inspect and forward directly.
-		p.handlePlaintext(pConn)
+		p.handlePlaintext(pConn, spiffeID)
 	}
 }
 
 // handleTLS performs TLS interception: generate cert, decrypt, inspect, re-encrypt to origin.
-func (p *mitmProxy) handleTLS(conn net.Conn) {
+func (p *mitmProxy) handleTLS(conn net.Conn, spiffeID string) {
 	tlsConn := tls.Server(conn, &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
@@ -216,7 +241,7 @@ func (p *mitmProxy) handleTLS(conn net.Conn) {
 
 	log.Printf("mitm: %s https://%s%s", req.Method, domain, req.URL.Path)
 
-	result, headers := p.runPolicy(domain, req, bodyBytes)
+	result, headers := p.runPolicy(domain, req, bodyBytes, spiffeID)
 	if result.Action == ActionDeny {
 		log.Printf("mitm: DENIED %s https://%s%s — %s", req.Method, domain, req.URL.Path, result.Message)
 		mitmWriteResponse(tlsConn, result.StatusCode, result.Message)
@@ -243,7 +268,7 @@ func (p *mitmProxy) handleTLS(conn net.Conn) {
 
 // handlePlaintext reads a plaintext HTTP request from the tunnel,
 // runs policies, and forwards to the origin over plain HTTP.
-func (p *mitmProxy) handlePlaintext(conn net.Conn) {
+func (p *mitmProxy) handlePlaintext(conn net.Conn, spiffeID string) {
 	br := bufio.NewReader(conn)
 	req, err := http.ReadRequest(br)
 	if err != nil {
@@ -261,7 +286,7 @@ func (p *mitmProxy) handlePlaintext(conn net.Conn) {
 
 	log.Printf("mitm: %s http://%s%s (plaintext tunnel)", req.Method, domain, req.URL.Path)
 
-	result, headers := p.runPolicy(hostOnly(domain), req, bodyBytes)
+	result, headers := p.runPolicy(hostOnly(domain), req, bodyBytes, spiffeID)
 	if result.Action == ActionDeny {
 		log.Printf("mitm: DENIED %s http://%s%s — %s", req.Method, domain, req.URL.Path, result.Message)
 		mitmWriteResponse(conn, result.StatusCode, result.Message)
@@ -291,7 +316,7 @@ func (p *mitmProxy) plaintextClient() *http.Client {
 }
 
 // runPolicy builds a RequestContext and runs PhaseMITMURL through the engine.
-func (p *mitmProxy) runPolicy(domain string, req *http.Request, body []byte) (*PolicyResult, map[string]string) {
+func (p *mitmProxy) runPolicy(domain string, req *http.Request, body []byte, spiffeID string) (*PolicyResult, map[string]string) {
 	headers := make(map[string]string)
 	for k, v := range req.Header {
 		if len(v) > 0 {
@@ -301,6 +326,7 @@ func (p *mitmProxy) runPolicy(domain string, req *http.Request, body []byte) (*P
 
 	ctx := &RequestContext{
 		Phase:      PhaseMITMURL,
+		SpiffeID:   spiffeID,
 		Method:     req.Method,
 		Path:       req.URL.Path,
 		Host:       domain,

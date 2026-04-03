@@ -41,6 +41,7 @@ func main() {
 	}
 
 	engine := NewEngine()
+	connStore := NewConnIdentityStore()
 
 	if *crdMode {
 		ctrl, err := NewController(engine, ns)
@@ -70,7 +71,7 @@ func main() {
 
 	// ---- Optionally start the MITM proxy --------------------------------
 	if *mitmCACert != "" && *mitmCAKey != "" {
-		proxy, err := newMITMProxy(*mitmCACert, *mitmCAKey, engine)
+		proxy, err := newMITMProxy(*mitmCACert, *mitmCAKey, engine, connStore)
 		if err != nil {
 			log.Fatalf("mitm init: %v", err)
 		}
@@ -90,7 +91,7 @@ func main() {
 	grpcServer := grpc.NewServer()
 
 	// Both ext_authz and ext_proc on the same port.
-	auth.RegisterAuthorizationServer(grpcServer, &authzServer{engine: engine})
+	auth.RegisterAuthorizationServer(grpcServer, &authzServer{engine: engine, connStore: connStore})
 	ext_proc.RegisterExternalProcessorServer(grpcServer, &extProcServer{engine: engine})
 
 	reflection.Register(grpcServer)

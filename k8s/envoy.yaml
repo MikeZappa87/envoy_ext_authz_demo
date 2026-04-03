@@ -227,6 +227,16 @@ static_resources:
 
     - name: mitm_cluster
       type: STRICT_DNS
+      transport_socket:
+        name: envoy.transport_sockets.upstream_proxy_protocol
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.proxy_protocol.v3.ProxyProtocolUpstreamTransport
+          config:
+            version: V1
+          transport_socket:
+            name: envoy.transport_sockets.raw_buffer
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.raw_buffer.v3.RawBuffer
       load_assignment:
         cluster_name: mitm_cluster
         endpoints:

@@ -21,7 +21,8 @@ import (
 
 type authzServer struct {
 	auth.UnimplementedAuthorizationServer
-	engine *Engine
+	engine    *Engine
+	connStore *ConnIdentityStore
 }
 
 func (s *authzServer) Check(ctx context.Context, req *auth.CheckRequest) (*auth.CheckResponse, error) {
@@ -64,6 +65,13 @@ func (s *authzServer) Check(ctx context.Context, req *auth.CheckRequest) (*auth.
 	// For CONNECT requests the destination is in :authority / host.
 	if rctx.Method == "CONNECT" {
 		rctx.ConnectAuthority = httpReq.GetHost()
+		// Store SPIFFE ID for MITM proxy to look up by source address.
+		if s.connStore != nil {
+			srcAddr := attrs.GetSource().GetAddress().GetSocketAddress().GetAddress()
+			if srcAddr != "" {
+				s.connStore.Set(srcAddr, rctx.SpiffeID)
+			}
+		}
 	}
 
 	result := s.engine.Run(rctx)

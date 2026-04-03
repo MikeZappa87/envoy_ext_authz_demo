@@ -3,7 +3,8 @@
 .PHONY: all certs deps run-policyengine run-upstream run-envoy run-client run-connect run-mitm stop clean help \
         k8s-cluster k8s-build k8s-deploy k8s-test-allow k8s-test-deny k8s-test-body-deny k8s-test-all k8s-logs k8s-destroy \
         k8s-apply-policies k8s-delete-policies k8s-test-connect-allow k8s-test-connect-deny \
-        k8s-test-mitm-allow k8s-test-mitm-deny-domain k8s-test-mitm-deny-path
+        k8s-test-mitm-allow k8s-test-mitm-deny-domain k8s-test-mitm-deny-path \
+        k8s-test-mitm-spiffe-allow k8s-test-mitm-spiffe-deny
 
 ENVOY_IMAGE := envoyproxy/envoy:v1.37-latest
 CERT_DIR    := certs
@@ -201,7 +202,7 @@ k8s-test-body-deny: ## Test denied body against Kind cluster
 		-d '{"action":"blocked"}' \
 		https://localhost:8443/hello
 
-k8s-test-all: k8s-test-allow k8s-test-deny k8s-test-body-deny k8s-test-connect-allow k8s-test-connect-deny k8s-test-mitm-allow k8s-test-mitm-deny-domain k8s-test-mitm-deny-path ## Run all K8s test cases
+k8s-test-all: k8s-test-allow k8s-test-deny k8s-test-body-deny k8s-test-connect-allow k8s-test-connect-deny k8s-test-mitm-allow k8s-test-mitm-deny-domain k8s-test-mitm-deny-path k8s-test-mitm-spiffe-allow k8s-test-mitm-spiffe-deny ## Run all K8s test cases
 
 k8s-test-connect-allow: ## Test allowed CONNECT tunnel against Kind cluster
 	@echo "==> Testing CONNECT ALLOW (Kind cluster)..."
@@ -241,6 +242,26 @@ k8s-test-mitm-deny-path: ## Test MITM: blocked path (httpbin.org/post)
 		--proxy-key    $(CERT_DIR)/client.key \
 		--cacert $(CERT_DIR)/proxy-ca.crt \
 		https://httpbin.org/post -X POST -d 'test'
+
+k8s-test-mitm-spiffe-allow: ## Test MITM: SPIFFE-allowed URL (httpbin.org/get)
+	@echo "==> Testing MITM SPIFFE ALLOW (httpbin.org/get)..."
+	curl -s -o - -w "\nHTTP %{http_code}\n" \
+		--proxy https://localhost:8445 \
+		--proxy-cacert $(CERT_DIR)/$(SERVER_CA) \
+		--proxy-cert   $(CERT_DIR)/client.crt \
+		--proxy-key    $(CERT_DIR)/client.key \
+		--cacert $(CERT_DIR)/proxy-ca.crt \
+		https://httpbin.org/get
+
+k8s-test-mitm-spiffe-deny: ## Test MITM: SPIFFE-denied URL (httpbin.org/)
+	@echo "==> Testing MITM SPIFFE DENY (httpbin.org/)..."
+	@curl -s -o - -w "\nHTTP %{http_code}\n" \
+		--proxy https://localhost:8445 \
+		--proxy-cacert $(CERT_DIR)/$(SERVER_CA) \
+		--proxy-cert   $(CERT_DIR)/client.crt \
+		--proxy-key    $(CERT_DIR)/client.key \
+		--cacert $(CERT_DIR)/proxy-ca.crt \
+		https://httpbin.org/ || true
 
 k8s-logs: ## Tail logs from all pods in the poc namespace
 	@kubectl logs -n $(K8S_NS) -l app=policyengine --tail=20 --prefix

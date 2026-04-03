@@ -94,10 +94,20 @@ spec:
         "httpbin.org": {"/post", "/delete", "/anything"},
       }
 
+      # Per-SPIFFE-ID allowed URL prefixes (host + path).
+      # If an entry exists for the SPIFFE ID, only listed prefixes are allowed.
+      mitm_spiffe_allowed := {
+        "spiffe://poc/go-client": [
+          {"host": "httpbin.org", "path_prefix": "/get"},
+          {"host": "httpbin.org", "path_prefix": "/ip"},
+        ],
+      }
+
       allow if {
         input.phase == "mitm_url"
         not mitm_domain_blocked
         not mitm_path_blocked
+        not mitm_spiffe_denied
       }
 
       mitm_domain_blocked if {
@@ -113,6 +123,24 @@ spec:
         paths := mitm_blocked_paths[input.host]
         some prefix in paths
         startswith(input.path, prefix)
+      }
+
+      # If SPIFFE ID has an allowlist AND the host is covered, deny unless match.
+      mitm_spiffe_denied if {
+        rules := mitm_spiffe_allowed[input.spiffe_id]
+        mitm_spiffe_host_covered(rules)
+        not mitm_spiffe_match(rules)
+      }
+
+      mitm_spiffe_host_covered(rules) if {
+        some rule in rules
+        rule.host == input.host
+      }
+
+      mitm_spiffe_match(rules) if {
+        some rule in rules
+        rule.host == input.host
+        startswith(input.path, rule.path_prefix)
       }
 
       # --- Reason ---
@@ -147,6 +175,17 @@ spec:
         not allow
         input.phase == "mitm_url"
         not mitm_domain_blocked
+        not mitm_path_blocked
+        mitm_spiffe_denied
+        msg := sprintf("denied by MITM: %s %s%s not allowed for %s",
+          [input.method, input.host, input.path, input.spiffe_id])
+      }
+
+      reason := msg if {
+        not allow
+        input.phase == "mitm_url"
+        not mitm_domain_blocked
+        mitm_path_blocked
         msg := sprintf("denied by MITM: %s %s on %s is blocked",
           [input.method, input.path, input.host])
       }
