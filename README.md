@@ -4,7 +4,7 @@ A proof-of-concept demonstrating a **middleware-chain policy engine** that serve
 
 ## Architecture
 
-### Pods (4 total)
+### Pods (4 total + optional SPIRE)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -20,6 +20,9 @@ A proof-of-concept demonstrating a **middleware-chain policy engine** that serve
 │  opa pod       :8181  (REST Data API + Rego)                        │
 ├─────────────────────────────────────────────────────────────────────┤
 │  upstream pod  :8080  (test backend)                                │
+├─────────────────────────────────────────────────────────────────────┤
+│  spire-server  :8081  (SPIRE Server — optional, spire-system ns)    │
+│  spire-agent   (DaemonSet, SDS socket at /run/spire/sockets)        │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -53,8 +56,13 @@ Client ─── mTLS H2 CONNECT ───▶ Envoy :8444
                                    │
                                    ├── ext_authz ── gRPC ──▶ policyengine :9191
                                    │    └─ PhaseAuthz: SPIFFE check → OPA domain allowlist
+                                   │       + stores clientIP→spiffeID in ConnIdentityStore
                                    │
-                                   └── CONNECT tunnel ── TCP ──▶ policyengine :9192 (MITM)
+                                   └── CONNECT tunnel ── TCP + PROXY proto v1 ──▶ policyengine :9192 (MITM)
+                                                                     │
+                                                           Parse PROXY protocol header
+                                                           → extract real client IP
+                                                           → look up SPIFFE ID from store
                                                                      │
                                                            peek first byte (not 0x16)
                                                            → plaintext HTTP detected
@@ -63,7 +71,8 @@ Client ─── mTLS H2 CONNECT ───▶ Envoy :8444
                                                            (method, path, headers, body)
                                                                      │
                                                            PhaseMITMURL → OPA
-                                                           (domain blocklist + path blocklist)
+                                                           (domain blocklist + path blocklist
+                                                            + per-SPIFFE-ID URL allowlist)
                                                                      │
                                                            Forward ── HTTP ──▶ origin
 ```
@@ -79,8 +88,13 @@ Client ─── mTLS H2 CONNECT ───▶ Envoy :8445
                                    │
                                    ├── ext_authz ── gRPC ──▶ policyengine :9191
                                    │    └─ PhaseAuthz: SPIFFE check → OPA domain allowlist
+                                   │       + stores clientIP→spiffeID in ConnIdentityStore
                                    │
-                                   └── CONNECT tunnel ── TCP ──▶ policyengine :9192 (MITM)
+                                   └── CONNECT tunnel ── TCP + PROXY proto v1 ──▶ policyengine :9192 (MITM)
+                                                                     │
+                                                           Parse PROXY protocol header
+                                                           → extract real client IP
+                                                           → look up SPIFFE ID from store
                                                                      │
                                                            peek first byte (0x16)
                                                            → TLS ClientHello detected
@@ -92,7 +106,8 @@ Client ─── mTLS H2 CONNECT ───▶ Envoy :8445
                                                            (method, path, headers, body)
                                                                      │
                                                            PhaseMITMURL → OPA
-                                                           (domain blocklist + path blocklist)
+                                                           (domain blocklist + path blocklist
+                                                            + per-SPIFFE-ID URL allowlist)
                                                                      │
                                                            Forward ── HTTPS ──▶ real origin
                                                            (e.g., httpbin.org, cnn.com)
@@ -118,13 +133,18 @@ tunneled through Envoy's H2 CONNECT listener with MITM inspection:
    │                                  │     SPIFFE ID from client cert   │                                │
    │                                  │     connect_authority=           │                                │
    │                                  │       httpbin.org:443            │                                │
+   │                                  │  (stores clientIP→spiffeID)      │                                │
    │                                  │◀──── ALLOW ──────────────────────│                                │
    │                                  │                                  │                                │
    │◀──── 4. 200 OK ──────────────────│                                  │                                │
    │     (tunnel is now open)         │                                  │                                │
    │                                  │                                  │                                │
-   │──── 5. TLS ClientHello ─────────▶│──── raw bytes ──────────────────▶│                                │
-   │     (SNI=httpbin.org)            │     (opaque tunnel)              │                                │
+   │──── 5. TLS ClientHello ─────────▶│── PROXY proto + raw bytes ──────▶│                                │
+   │     (SNI=httpbin.org)            │  (PROXY TCP4 <clientIP> ...)     │                                │
+   │                                  │                                  │                                │
+   │                                  │                                  │── 5a. parse PROXY protocol     │
+   │                                  │                                  │   → real clientIP               │
+   │                                  │                                  │   → look up SPIFFE ID          │
    │                                  │                                  │                                │
    │                                  │                                  │── 6. peek first byte (0x16)    │
    │                                  │                                  │   → TLS detected               │
@@ -144,6 +164,7 @@ tunneled through Envoy's H2 CONNECT listener with MITM inspection:
    │                                  │                                  │                                │
    │                                  │                                  │── 11. PhaseMITMURL → engine    │
    │                                  │                                  │   OPA: domain ok? path ok?     │
+   │                                  │                                  │   SPIFFE URL allowlist ok?     │
    │                                  │                                  │   → ALLOW                      │
    │                                  │                                  │                                │
    │                                  │                                  │──── 12. TLS connect ──────────▶│
@@ -174,7 +195,7 @@ tunneled through Envoy's H2 CONNECT listener with MITM inspection:
 |---|---|---|
 | ext_authz (all listeners) | `spiffe_id`, `method`, `path`, `connect_authority` | `spiffe://poc/go-client`, `CONNECT`, `httpbin.org:443` |
 | ext_proc (:8443 only) | `spiffe_id`, `headers`, `body` | `spiffe://poc/go-client`, `x-debug` header, `{"action":"blocked"}` |
-| mitm_url (:8444 + :8445) | `host`, `method`, `path`, `headers`, `body` | `foxnews.com`, `GET`, `/politics` |
+| mitm_url (:8444 + :8445) | `spiffe_id`, `host`, `method`, `path`, `headers`, `body` | `spiffe://poc/go-client`, `httpbin.org`, `GET`, `/get` |
 
 #### SPIFFE Identity Flow (ext_authz → ext_proc)
 
@@ -256,10 +277,12 @@ If Layer 1 denies, the tunnel never opens — the client gets a 403.
 | Headers | HTTP request headers | Block requests with specific `User-Agent` |
 | Body | HTTP request body (up to 1 MB) | Block JSON with `"action": "drop"` |
 
-**What Layer 2 does NOT have:**
-- **SPIFFE ID** — mTLS terminated at Envoy, not at the MITM proxy. The tunnel is a raw TCP pipe.
-- **True source IP** — the TCP connection comes from Envoy, not the original client.
+**What Layer 2 does NOT have (without PROXY protocol):**
 - **5-tuple** — the connection is always `envoy → policyengine:9192`.
+
+**What Layer 2 DOES have (via PROXY protocol + in-memory identity store):**
+- **SPIFFE ID** — ext_authz stores `clientIP → spiffeID` on CONNECT; the MITM proxy reads the real client IP from the PROXY protocol v1 header and looks it up.
+- **True source IP** — Envoy prepends PROXY protocol v1 to the TCP tunnel, carrying the original client IP.
 
 **Example: two-layer deny**
 ```
@@ -273,8 +296,10 @@ Layer 2 (mitm_url):
 **Key design decisions:**
 - Both ext_authz and ext_proc gRPC services on the **same port / same server** — Envoy points both filters at one cluster.
 - The MITM proxy runs in the **same binary** as the policy engine — no extra pod, calls the engine directly (no OPA HTTP round-trip for policy execution).
+- **PROXY protocol v1** on the mitm_cluster carries the real client IP through Envoy's CONNECT tunnel, enabling SPIFFE ID lookup in the MITM proxy via a shared in-memory store (`ConnIdentityStore`).
 - Policies are driven by **Policy CRDs** — `kubectl apply` a CR and the chain + OPA rules hot-reload with zero restarts.
 - OPA Rego is embedded **inline** in the Policy CR; the controller pushes it to OPA's Policy API automatically.
+- Optional **SPIRE SDS** integration — Envoy can use SPIRE-issued certificates instead of static files (see `k8s/spire/`).
 
 ## Policy Chain
 
@@ -381,9 +406,21 @@ make run-mitm          # Run the MITM proxy locally on :9192
 make k8s-cluster       # create Kind cluster (ports 8443 + 8444 + 8445)
 make k8s-build         # build + load images
 make k8s-deploy        # deploy everything (CRD, RBAC, OPA, policyengine, upstream, envoy)
-make k8s-test-all      # run all 8 test cases
+make k8s-test-all      # run all 10 test cases
 make k8s-logs          # view policy engine logs
 make k8s-destroy       # tear down
+```
+
+#### With SPIRE SDS (optional)
+
+```sh
+# After k8s-deploy, add SPIRE for SDS-based certificates:
+kubectl apply -f k8s/spire/spire-server.yaml
+kubectl apply -f k8s/spire/spire-agent.yaml
+bash k8s/spire/register-entries.sh
+kubectl apply -f k8s/spire/envoy-deploy-spire.yaml
+# Use spire-ca.crt for server verification:
+make k8s-test-all SERVER_CA=spire-ca.crt
 ```
 
 ### Hot-Reload Demo
@@ -420,12 +457,14 @@ kubectl get policies -n poc # list current policies
 | `make k8s-deploy` | Deploy to Kind (CRD, RBAC, OPA, workloads, Policy CRs) |
 | `make k8s-apply-policies` | Apply Policy CRs from `k8s/policies/` |
 | `make k8s-delete-policies` | Delete all Policy CRs |
-| `make k8s-test-all` | Run all K8s test cases (8 tests) |
+| `make k8s-test-all` | Run all K8s test cases (10 tests) |
 | `make k8s-test-connect-allow` | Test allowed CONNECT tunnel |
 | `make k8s-test-connect-deny` | Test denied CONNECT destination |
 | `make k8s-test-mitm-allow` | Test MITM: allowed HTTPS URL |
 | `make k8s-test-mitm-deny-domain` | Test MITM: blocked domain |
 | `make k8s-test-mitm-deny-path` | Test MITM: blocked path |
+| `make k8s-test-mitm-spiffe-allow` | Test MITM: SPIFFE-allowed URL |
+| `make k8s-test-mitm-spiffe-deny` | Test MITM: SPIFFE-denied URL |
 | `make k8s-logs` | Tail pod logs |
 | `make k8s-destroy` | Delete Kind cluster |
 
@@ -495,7 +534,9 @@ curl --proxy https://localhost:8445 \
 │   ├── engine.go             # Middleware chain runner (thread-safe)
 │   ├── authz.go              # ext_authz gRPC handler
 │   ├── extproc.go            # ext_proc gRPC handler
-│   ├── mitm.go               # MITM proxy (auto-detects TLS vs plaintext)
+│   ├── mitm.go               # MITM proxy (auto-detects TLS vs plaintext, PROXY protocol)
+│   ├── connidentity.go       # Shared in-memory SPIFFE ID store (ext_authz → MITM)
+│   ├── accesslog.go          # Structured JSON access logging
 │   ├── controller.go         # CRD controller — watches Policy CRs, rebuilds chain
 │   ├── factory.go            # Converts CRD spec → concrete Policy instances
 │   ├── policy_spiffe.go      # L4: SPIFFE identity validation
@@ -514,15 +555,21 @@ curl --proxy https://localhost:8445 \
 │   ├── namespace.yaml        # poc namespace
 │   ├── crd.yaml              # Policy CRD definition
 │   ├── rbac.yaml             # ServiceAccount + ClusterRole for controller
-│   ├── envoy.yaml            # Envoy config for K8s (3 listeners)
+│   ├── envoy.yaml            # Envoy config for K8s (3 listeners, static certs)
 │   ├── envoy-deploy.yaml     # Envoy Deployment + NodePort Service
 │   ├── policyengine.yaml     # Policy engine Deployment (--crd + --mitm) + Service
 │   ├── opa.yaml              # OPA Deployment + Service
 │   ├── upstream.yaml         # Upstream Deployment + Service
-│   └── policies/             # Policy CRs applied on deploy
-│       ├── spiffe.yaml       # SPIFFE identity policy (order 10)
-│       ├── header-inject.yaml # Header injection policy (order 15)
-│       └── opa.yaml          # OPA policy with inline Rego (order 20)
+│   ├── policies/             # Policy CRs applied on deploy
+│   │   ├── spiffe.yaml       # SPIFFE identity policy (order 10)
+│   │   ├── header-inject.yaml # Header injection policy (order 15)
+│   │   └── opa.yaml          # OPA policy with inline Rego (order 20)
+│   └── spire/                # SPIRE integration (optional SDS-based certs)
+│       ├── spire-server.yaml # SPIRE server StatefulSet
+│       ├── spire-agent.yaml  # SPIRE agent DaemonSet
+│       ├── register-entries.sh # Register SPIFFE identities
+│       ├── envoy-spire.yaml  # Envoy config using SPIRE SDS
+│       └── envoy-deploy-spire.yaml # Envoy Deployment with SPIRE socket
 ├── upstream/
 │   ├── main.go               # Simple HTTP upstream app
 │   └── Dockerfile
