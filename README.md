@@ -108,9 +108,9 @@ tunneled through Envoy's H2 CONNECT listener with MITM inspection:
    │                                  │                                  │                                │
    │──── 1. mTLS handshake ──────────▶│                                  │                                │
    │     (client cert + server cert)  │                                  │                                │
-   │◀──── TLS established ───────────│                                  │                                │
+   │◀──── TLS established ────────────│                                  │                                │
    │                                  │                                  │                                │
-   │──── 2. H2 CONNECT ─────────────▶│                                  │                                │
+   │──── 2. H2 CONNECT ──────────────▶│                                  │                                │
    │     :method=CONNECT              │                                  │                                │
    │     :authority=httpbin.org:443   │                                  │                                │
    │                                  │                                  │                                │
@@ -118,41 +118,41 @@ tunneled through Envoy's H2 CONNECT listener with MITM inspection:
    │                                  │     SPIFFE ID from client cert   │                                │
    │                                  │     connect_authority=           │                                │
    │                                  │       httpbin.org:443            │                                │
-   │                                  │◀──── ALLOW ─────────────────────│                                │
+   │                                  │◀──── ALLOW ──────────────────────│                                │
    │                                  │                                  │                                │
-   │◀──── 4. 200 OK ────────────────│                                  │                                │
+   │◀──── 4. 200 OK ──────────────────│                                  │                                │
    │     (tunnel is now open)         │                                  │                                │
    │                                  │                                  │                                │
-   │──── 5. TLS ClientHello ─────────▶│──── raw bytes ─────────────────▶│                                │
+   │──── 5. TLS ClientHello ─────────▶│──── raw bytes ──────────────────▶│                                │
    │     (SNI=httpbin.org)            │     (opaque tunnel)              │                                │
    │                                  │                                  │                                │
    │                                  │                                  │── 6. peek first byte (0x16)    │
    │                                  │                                  │   → TLS detected               │
    │                                  │                                  │                                │
    │                                  │                                  │── 7. generate cert for         │
-   │                                  │                                  │   httpbin.org signed by         │
-   │                                  │                                  │   proxy CA                      │
+   │                                  │                                  │   httpbin.org signed by        │
+   │                                  │                                  │   proxy CA                     │
    │                                  │                                  │                                │
-   │◀──── 8. TLS handshake ──────────│◀──── proxy CA cert ─────────────│                                │
+   │◀──── 8. TLS handshake ──────────│◀──── proxy CA cert ───────────────│                                │
    │     (client sees proxy CA cert   │                                  │                                │
    │      for httpbin.org)            │                                  │                                │
    │                                  │                                  │                                │
-   │──── 9. GET /get HTTP/1.1 ───────▶│──── encrypted bytes ───────────▶│                                │
+   │──── 9. GET /get HTTP/1.1 ───────▶│──── encrypted bytes ────────────▶│                                │
    │     Host: httpbin.org            │                                  │── 10. decrypt, read HTTP req   │
-   │                                  │                                  │   method=GET path=/get          │
-   │                                  │                                  │   host=httpbin.org              │
+   │                                  │                                  │   method=GET path=/get         │
+   │                                  │                                  │   host=httpbin.org             │
    │                                  │                                  │                                │
    │                                  │                                  │── 11. PhaseMITMURL → engine    │
-   │                                  │                                  │   OPA: domain ok? path ok?      │
-   │                                  │                                  │   → ALLOW                       │
+   │                                  │                                  │   OPA: domain ok? path ok?     │
+   │                                  │                                  │   → ALLOW                      │
    │                                  │                                  │                                │
    │                                  │                                  │──── 12. TLS connect ──────────▶│
-   │                                  │                                  │     (real cert for              │
-   │                                  │                                  │      httpbin.org)               │
+   │                                  │                                  │     (real cert for             │
+   │                                  │                                  │      httpbin.org)              │
    │                                  │                                  │──── GET /get ─────────────────▶│
    │                                  │                                  │                                │
-   │                                  │                                  │◀──── 200 OK + body ───────────│
-   │◀──── 13. response ──────────────│◀──── re-encrypt + forward ──────│                                │
+   │                                  │                                  │◀──── 200 OK + body ────────────│
+   │◀──── 13. response ───────────────│◀──── re-encrypt + forward ───────│                                │
    │     (encrypted with proxy CA     │                                  │                                │
    │      session key)                │                                  │                                │
 ```
@@ -173,8 +173,62 @@ tunneled through Envoy's H2 CONNECT listener with MITM inspection:
 | Stage | Fields available | Example |
 |---|---|---|
 | ext_authz (all listeners) | `spiffe_id`, `method`, `path`, `connect_authority` | `spiffe://poc/go-client`, `CONNECT`, `httpbin.org:443` |
-| ext_proc (:8443 only) | `headers`, `body` | `x-debug` header, `{"action":"blocked"}` |
+| ext_proc (:8443 only) | `spiffe_id`, `headers`, `body` | `spiffe://poc/go-client`, `x-debug` header, `{"action":"blocked"}` |
 | mitm_url (:8444 + :8445) | `host`, `method`, `path`, `headers`, `body` | `foxnews.com`, `GET`, `/politics` |
+
+#### SPIFFE Identity Flow (ext_authz → ext_proc)
+
+The SPIFFE ID is extracted from the client certificate during ext_authz and injected as
+a request header so ext_proc phases can make identity-aware decisions. The header is
+stripped before reaching upstream to prevent leakage.
+
+```
+ Client                          Envoy                             Policyengine              Upstream
+   │                                │                                    │                       │
+   │── mTLS (client cert) ─────────▶│                                    │                       │
+   │── GET /hello ─────────────────▶│                                    │                       │
+   │                                │                                    │                       │
+   │                    ┌───────────┤                                    │                       │
+   │                    │ ext_authz │── Check(cert, method, path) ──────▶│                       │
+   │                    │           │                                    │                       │
+   │                    │           │                          Parse client cert PEM             │
+   │                    │           │                          Extract URI SAN:                  │
+   │                    │           │                            spiffe://poc/go-client          │
+   │                    │           │                          engine.Run(PhaseAuthz) → ALLOW    │
+   │                    │           │                                    │                       │
+   │                    │           │◀── OK + inject headers: ───────────│                       │
+   │                    │           │      x-spiffe-id: spiffe://poc/go-client                   │
+   │                    │           │      x-cert-subject: CN=go-client  │                       │
+   │                    └───────────┤                                    │                       │
+   │                                │                                    │                       │
+   │                                │  Envoy copies injected headers     │                       │
+   │                                │  onto the request                  │                       │
+   │                                │                                    │                       │
+   │                    ┌───────────┤                                    │                       │
+   │                    │ ext_proc  │── RequestHeaders(all headers) ────▶│                       │
+   │                    │           │   includes x-spiffe-id,            │                       │
+   │                    │           │   x-cert-subject                   │                       │
+   │                    │           │                                    │                       │
+   │                    │           │                          Read x-spiffe-id → rctx.SpiffeID  │
+   │                    │           │                          Read x-cert-subject → rctx.Subject│
+   │                    │           │                          engine.Run(PhaseRequestHeaders)   │
+   │                    │           │                                    │                       │
+   │                    │           │◀── HeadersResponse: ───────────────│                       │
+   │                    │           │      remove: x-spiffe-id,          │                       │
+   │                    │           │              x-cert-subject        │                       │
+   │                    └───────────┤                                    │                       │
+   │                                │                                    │                       │
+   │                                │── GET /hello ─────────────────────────────────────────────▶│
+   │                                │   (identity headers stripped)      │                       │
+   │                                │                                                            │
+   │◀── 200 OK ────────────────────│◀────────────────────────────────────────────────────────────│
+```
+
+**Key design points:**
+- **Cryptographic extraction** happens once in ext_authz — the SPIFFE ID comes from the X.509 URI SAN, not from any client-supplied header
+- **Header injection** bridges ext_authz and ext_proc — Envoy copies the injected headers onto the request before ext_proc sees them
+- **Header stripping** in ext_proc removes `x-spiffe-id` and `x-cert-subject` before the request reaches upstream, preventing leakage and spoofing
+- **Identity is trustworthy** within the filter chain because Envoy overwrites any client-supplied values with the ext_authz response headers
 
 ### Two-Layer Policy Model (CONNECT tunnels)
 
