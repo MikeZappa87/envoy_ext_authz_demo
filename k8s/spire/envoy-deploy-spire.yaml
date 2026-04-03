@@ -1,0 +1,75 @@
+# Envoy deployment using SPIRE SDS for certificate management.
+# Uses envoy-spire.yaml config instead of static certs.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: envoy
+  namespace: poc
+  labels:
+    app: envoy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: envoy
+  template:
+    metadata:
+      labels:
+        app: envoy
+    spec:
+      containers:
+        - name: envoy
+          image: envoyproxy/envoy:v1.37-latest
+          args: ["-c", "/etc/envoy/envoy.yaml"]
+          ports:
+            - containerPort: 8443
+            - containerPort: 8444
+            - containerPort: 8445
+            - containerPort: 9901
+          volumeMounts:
+            - name: envoy-config
+              mountPath: /etc/envoy/envoy.yaml
+              subPath: envoy.yaml
+            - name: spire-agent-socket
+              mountPath: /run/spire/sockets
+              readOnly: true
+            - name: envoy-certs
+              mountPath: /etc/envoy/certs
+              readOnly: true
+      volumes:
+        - name: envoy-config
+          configMap:
+            name: envoy-config-spire
+        - name: spire-agent-socket
+          hostPath:
+            path: /run/spire/sockets
+            type: Directory
+        - name: envoy-certs
+          secret:
+            secretName: envoy-certs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: envoy
+  namespace: poc
+spec:
+  type: NodePort
+  selector:
+    app: envoy
+  ports:
+    - name: https
+      port: 8443
+      targetPort: 8443
+      nodePort: 30443
+    - name: connect
+      port: 8444
+      targetPort: 8444
+      nodePort: 30444
+    - name: mitm
+      port: 8445
+      targetPort: 8445
+      nodePort: 30445
+    - name: admin
+      port: 9901
+      targetPort: 9901

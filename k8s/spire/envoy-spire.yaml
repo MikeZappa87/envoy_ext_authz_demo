@@ -1,0 +1,273 @@
+# envoy-spire.yaml for Kubernetes — SPIRE SDS integration
+#
+# Same listeners/filters/routes as envoy.yaml but uses SPIRE SDS
+# for certificate management instead of static files.
+#
+# Requires: SPIRE agent running on the node with socket at
+# /run/spire/sockets/agent.sock mounted into the Envoy pod.
+
+node:
+  id: "envoy-poc"
+  cluster: "poc"
+
+static_resources:
+  listeners:
+    - name: ingress
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8443 }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              require_client_certificate: true
+              common_tls_context:
+                tls_params:
+                  tls_minimum_protocol_version: TLSv1_3
+                  tls_maximum_protocol_version: TLSv1_3
+                alpn_protocols: ["h2"]
+                tls_certificate_sds_secret_configs:
+                  - name: "spiffe://poc/envoy"
+                    sds_config:
+                      resource_api_version: V3
+                      api_config_source:
+                        api_type: GRPC
+                        grpc_services:
+                          - envoy_grpc:
+                              cluster_name: spire_agent
+                        transport_api_version: V3
+                validation_context:
+                  trusted_ca: { filename: "/etc/envoy/certs/ca.crt" }
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                http_filters:
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      grpc_service:
+                        envoy_grpc:
+                          cluster_name: policyengine_cluster
+                        timeout: 2s
+                      transport_api_version: V3
+                      include_peer_certificate: true
+                      failure_mode_allow: false
+                  - name: envoy.filters.http.ext_proc
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                      grpc_service:
+                        envoy_grpc:
+                          cluster_name: policyengine_cluster
+                        timeout: 2s
+                      processing_mode:
+                        request_header_mode: SEND
+                        request_body_mode: BUFFERED
+                        response_header_mode: SEND
+                        response_body_mode: NONE
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: upstream_cluster }
+
+    # ---- HTTP/2 CONNECT proxy listener ------------------------------------
+    - name: connect_proxy
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8444 }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              require_client_certificate: true
+              common_tls_context:
+                tls_params:
+                  tls_minimum_protocol_version: TLSv1_3
+                  tls_maximum_protocol_version: TLSv1_3
+                alpn_protocols: ["h2"]
+                tls_certificate_sds_secret_configs:
+                  - name: "spiffe://poc/envoy"
+                    sds_config:
+                      resource_api_version: V3
+                      api_config_source:
+                        api_type: GRPC
+                        grpc_services:
+                          - envoy_grpc:
+                              cluster_name: spire_agent
+                        transport_api_version: V3
+                validation_context:
+                  trusted_ca: { filename: "/etc/envoy/certs/ca.crt" }
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: connect_proxy
+                http2_protocol_options:
+                  allow_connect: true
+                  max_concurrent_streams: 100
+                  connection_keepalive:
+                    interval: 10s
+                    timeout: 20s
+                upgrade_configs:
+                  - upgrade_type: CONNECT
+                http_filters:
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      grpc_service:
+                        envoy_grpc:
+                          cluster_name: policyengine_cluster
+                        timeout: 2s
+                      transport_api_version: V3
+                      include_peer_certificate: true
+                      failure_mode_allow: false
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: connect_route
+                  virtual_hosts:
+                    - name: connect
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            connect_matcher: {}
+                          route:
+                            cluster: mitm_cluster
+                            upgrade_configs:
+                              - upgrade_type: CONNECT
+                                connect_config: {}
+
+    # ---- MITM HTTPS inspection listener (TLS interception) ----------------
+    - name: mitm_connect_proxy
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8445 }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              require_client_certificate: true
+              common_tls_context:
+                tls_params:
+                  tls_minimum_protocol_version: TLSv1_3
+                  tls_maximum_protocol_version: TLSv1_3
+                alpn_protocols: ["h2"]
+                tls_certificate_sds_secret_configs:
+                  - name: "spiffe://poc/envoy"
+                    sds_config:
+                      resource_api_version: V3
+                      api_config_source:
+                        api_type: GRPC
+                        grpc_services:
+                          - envoy_grpc:
+                              cluster_name: spire_agent
+                        transport_api_version: V3
+                validation_context:
+                  trusted_ca: { filename: "/etc/envoy/certs/ca.crt" }
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: mitm_connect
+                http2_protocol_options:
+                  allow_connect: true
+                  max_concurrent_streams: 100
+                  connection_keepalive:
+                    interval: 10s
+                    timeout: 20s
+                upgrade_configs:
+                  - upgrade_type: CONNECT
+                http_filters:
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      grpc_service:
+                        envoy_grpc:
+                          cluster_name: policyengine_cluster
+                        timeout: 2s
+                      transport_api_version: V3
+                      include_peer_certificate: true
+                      failure_mode_allow: false
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: mitm_route
+                  virtual_hosts:
+                    - name: mitm
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            connect_matcher: {}
+                          route:
+                            cluster: mitm_cluster
+                            upgrade_configs:
+                              - upgrade_type: CONNECT
+                                connect_config: {}
+
+  clusters:
+    # SPIRE agent — Unix domain socket for SDS
+    - name: spire_agent
+      connect_timeout: 1s
+      type: STATIC
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: spire_agent
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    pipe:
+                      path: /run/spire/sockets/agent.sock
+
+    - name: policyengine_cluster
+      type: STRICT_DNS
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: policyengine_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: policyengine.poc.svc.cluster.local, port_value: 9191 }
+
+    - name: upstream_cluster
+      type: STRICT_DNS
+      load_assignment:
+        cluster_name: upstream_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: upstream.poc.svc.cluster.local, port_value: 8080 }
+
+    - name: mitm_cluster
+      type: STRICT_DNS
+      load_assignment:
+        cluster_name: mitm_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: policyengine.poc.svc.cluster.local, port_value: 9192 }
+
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }

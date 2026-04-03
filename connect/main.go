@@ -58,10 +58,12 @@ func main() {
 		log.Fatal("failed to parse CA cert")
 	}
 
+	// Use the hostname from the proxy address for TLS verification.
+	proxyHost, _, _ := net.SplitHostPort(*proxyAddr)
 	tlsCfg := &tls.Config{
 		Certificates: []tls.Certificate{clientCert},
 		RootCAs:      caPool,
-		ServerName:   "envoy",
+		ServerName:   proxyHost,
 		NextProtos:   []string{"h2"},
 	}
 

@@ -9,6 +9,9 @@ ENVOY_IMAGE := envoyproxy/envoy:v1.37-latest
 CERT_DIR    := certs
 CLUSTER     := poc
 K8S_NS      := poc
+# Server CA for k8s tests. Override with spire-ca.crt when using SPIRE SDS:
+#   make k8s-test-all SERVER_CA=spire-ca.crt
+SERVER_CA   ?= ca.crt
 
 ##@ Setup
 
@@ -175,7 +178,7 @@ k8s-delete-policies: ## Delete all Policy CRs
 k8s-test-allow: ## Test allowed request against Kind cluster
 	@echo "==> Testing ALLOW (Kind cluster)..."
 	curl -s -o - -w "\nHTTP %{http_code}\n" \
-		--cacert $(CERT_DIR)/ca.crt \
+		--cacert $(CERT_DIR)/$(SERVER_CA) \
 		--cert   $(CERT_DIR)/client.crt \
 		--key    $(CERT_DIR)/client.key \
 		https://localhost:8443/hello
@@ -183,7 +186,7 @@ k8s-test-allow: ## Test allowed request against Kind cluster
 k8s-test-deny: ## Test denied request against Kind cluster
 	@echo "==> Testing DENY (Kind cluster)..."
 	curl -s -o - -w "\nHTTP %{http_code}\n" \
-		--cacert $(CERT_DIR)/ca.crt \
+		--cacert $(CERT_DIR)/$(SERVER_CA) \
 		--cert   $(CERT_DIR)/client.crt \
 		--key    $(CERT_DIR)/client.key \
 		https://localhost:8443/notallowedhere
@@ -191,7 +194,7 @@ k8s-test-deny: ## Test denied request against Kind cluster
 k8s-test-body-deny: ## Test denied body against Kind cluster
 	@echo "==> Testing BODY DENY (Kind cluster)..."
 	curl -s -o - -w "\nHTTP %{http_code}\n" \
-		--cacert $(CERT_DIR)/ca.crt \
+		--cacert $(CERT_DIR)/$(SERVER_CA) \
 		--cert   $(CERT_DIR)/client.crt \
 		--key    $(CERT_DIR)/client.key \
 		-X POST -H "Content-Type: application/json" \
@@ -202,18 +205,18 @@ k8s-test-all: k8s-test-allow k8s-test-deny k8s-test-body-deny k8s-test-connect-a
 
 k8s-test-connect-allow: ## Test allowed CONNECT tunnel against Kind cluster
 	@echo "==> Testing CONNECT ALLOW (Kind cluster)..."
-	go run ./connect/ -proxy localhost:8444 -target upstream.poc.svc.cluster.local:8080
+	go run ./connect/ -proxy localhost:8444 -ca $(CERT_DIR)/$(SERVER_CA) -target upstream.poc.svc.cluster.local:8080
 
 k8s-test-connect-deny: ## Test denied CONNECT destination against Kind cluster
 	@echo "==> Testing CONNECT DENY (Kind cluster)..."
-	@go run ./connect/ -proxy localhost:8444 -target evil.example.com:443 2>&1; \
+	@go run ./connect/ -proxy localhost:8444 -ca $(CERT_DIR)/$(SERVER_CA) -target evil.example.com:443 2>&1; \
 	if [ $$? -ne 0 ]; then echo "=> Correctly denied"; fi
 
 k8s-test-mitm-allow: ## Test MITM: allowed HTTPS URL (httpbin.org/get)
 	@echo "==> Testing MITM ALLOW (httpbin.org/get)..."
 	curl -s -o - -w "\nHTTP %{http_code}\n" \
 		--proxy https://localhost:8445 \
-		--proxy-cacert $(CERT_DIR)/ca.crt \
+		--proxy-cacert $(CERT_DIR)/$(SERVER_CA) \
 		--proxy-cert   $(CERT_DIR)/client.crt \
 		--proxy-key    $(CERT_DIR)/client.key \
 		--cacert $(CERT_DIR)/proxy-ca.crt \
@@ -223,7 +226,7 @@ k8s-test-mitm-deny-domain: ## Test MITM: blocked domain (foxnews.com)
 	@echo "==> Testing MITM DENY domain (foxnews.com)..."
 	@curl -s -o - -w "\nHTTP %{http_code}\n" \
 		--proxy https://localhost:8445 \
-		--proxy-cacert $(CERT_DIR)/ca.crt \
+		--proxy-cacert $(CERT_DIR)/$(SERVER_CA) \
 		--proxy-cert   $(CERT_DIR)/client.crt \
 		--proxy-key    $(CERT_DIR)/client.key \
 		--cacert $(CERT_DIR)/proxy-ca.crt \
@@ -233,7 +236,7 @@ k8s-test-mitm-deny-path: ## Test MITM: blocked path (httpbin.org/post)
 	@echo "==> Testing MITM DENY path (httpbin.org/post)..."
 	curl -s -o - -w "\nHTTP %{http_code}\n" \
 		--proxy https://localhost:8445 \
-		--proxy-cacert $(CERT_DIR)/ca.crt \
+		--proxy-cacert $(CERT_DIR)/$(SERVER_CA) \
 		--proxy-cert   $(CERT_DIR)/client.crt \
 		--proxy-key    $(CERT_DIR)/client.key \
 		--cacert $(CERT_DIR)/proxy-ca.crt \
